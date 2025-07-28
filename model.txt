@@ -1,0 +1,384 @@
+import requests
+import xml.etree.ElementTree as ET
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import zipfile
+import io
+import os
+import numpy as np
+from matplotlib.patches import Rectangle
+import warnings
+warnings.filterwarnings('ignore')
+
+# 한글 폰트 설정 (Colab용)
+plt.rcParams['font.family'] = 'DejaVu Sans'
+plt.rcParams['axes.unicode_minus'] = False
+
+# 📌 DART API KEY 입력
+api_key = "e7153f9582f89deb2169769816dcc61c826bd5cf"
+
+# 1. corpCode.zip 다운로드 및 압축 해제
+def download_and_extract_corp_code():
+    url = f"https://opendart.fss.or.kr/api/corpCode.xml?crtfc_key={api_key}"
+    res = requests.get(url)
+    if res.status_code == 200:
+        with open("corpCode.zip", "wb") as f:
+            f.write(res.content)
+        print("✅ corpCode.zip 다운로드 완료")
+
+        with zipfile.ZipFile("corpCode.zip", "r") as zip_ref:
+            zip_ref.extractall()
+        print("✅ corpCode.zip 압축 해제 완료")
+        return True
+    else:
+        print(f"❌ 다운로드 실패: {res.status_code}")
+        return False
+
+# 2. 회사명으로 corp_code 검색
+def get_corp_code(company_name):
+    tree = ET.parse("CORPCODE.xml")
+    root = tree.getroot()
+    exact_match = None
+    partial_matches = []
+    for item in root.iter("list"):
+        name = item.find("corp_name").text
+        code = item.find("corp_code").text
+        if name == company_name:
+            exact_match = code
+            print(f"🔍 정확히 일치하는 회사명 매칭: {name}")
+            break
+        elif company_name in name:
+            partial_matches.append((name, code))
+    if exact_match:
+        return exact_match
+    elif partial_matches:
+        print("🔍 부분 일치하는 회사명 후보:")
+        for n, c in partial_matches:
+            print(f"  - {n} : {c}")
+        print("❗ 정확한 회사명을 입력해주세요.")
+        return None
+    else:
+        print(f"❌ '{company_name}'에 해당하는 corp_code를 찾을 수 없습니다.")
+        return None
+
+# 3. 주요 재무지표 요청 함수
+def get_index_data(corp_code, year, reprt_code, idx_cl_code):
+    url = "https://opendart.fss.or.kr/api/fnlttSinglIndx.json"
+    params = {
+        "crtfc_key": api_key,
+        "corp_code": corp_code,
+        "bsns_year": year,
+        "reprt_code": reprt_code,
+        "idx_cl_code": idx_cl_code
+    }
+    res = requests.get(url, params=params)
+    data = res.json()
+    
+    if data["status"] != "000":
+        print(f"❌ API 에러: {data['message']}")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data["list"])
+    df["idx_val"] = pd.to_numeric(df["idx_val"], errors="coerce")
+    return df[["idx_cl_nm", "idx_nm", "idx_val"]]
+
+# 4. 모든 지표 분류 조회
+def fetch_all_indexes(corp_code, year="2023", reprt_code="11014"):
+    idx_cl_codes = {
+        "M210000": "수익성",
+        "M220000": "안정성",
+        "M230000": "성장성",
+        "M240000": "활동성"
+    }
+    all_data = pd.DataFrame()
+    for code, name in idx_cl_codes.items():
+        print(f"📥 {name} 지표 가져오는 중...")
+        df = get_index_data(corp_code, year, reprt_code, code)
+        if not df.empty:
+            all_data = pd.concat([all_data, df], ignore_index=True)
+    return all_data
+
+# 5. 지표별 해석 기준 정의
+def get_interpretation(category, metric_name, value):
+    """지표값에 대한 해석 제공"""
+    interpretations = {
+        "수익성": {
+            "default": {
+                "excellent": (15, "💰 매우 우수", "#1f77b4"),
+                "good": (10, "👍 양호", "#2ca02c"), 
+                "average": (5, "⚖️ 보통", "#ff7f0e"),
+                "poor": (0, "⚠️ 개선필요", "#d62728")
+            }
+        },
+        "안정성": {
+            "default": {
+                "excellent": (200, "🛡️ 매우 안정", "#1f77b4"),
+                "good": (150, "✅ 안정", "#2ca02c"),
+                "average": (100, "⚖️ 보통", "#ff7f0e"), 
+                "poor": (0, "⚠️ 불안정", "#d62728")
+            }
+        },
+        "성장성": {
+            "default": {
+                "excellent": (20, "🚀 고성장", "#1f77b4"),
+                "good": (10, "📈 성장", "#2ca02c"),
+                "average": (0, "⚖️ 보통", "#ff7f0e"),
+                "poor": (-10, "📉 감소", "#d62728")
+            }
+        },
+        "활동성": {
+            "default": {
+                "excellent": (5, "⚡ 매우 활발", "#1f77b4"),
+                "good": (3, "🔄 활발", "#2ca02c"),
+                "average": (1, "⚖️ 보통", "#ff7f0e"),
+                "poor": (0, "🐌 저조", "#d62728")
+            }
+        }
+    }
+    
+    criteria = interpretations.get(category, {}).get("default", interpretations["수익성"]["default"])
+    
+    for level, (threshold, label, color) in criteria.items():
+        if value >= threshold:
+            return label, color
+    
+    return criteria["poor"][1], criteria["poor"][2]
+
+# 6. 대시보드 스타일 종합 시각화
+def create_financial_dashboard(df, company_name, year):
+    """종합 재무 대시보드 생성"""
+    fig = plt.figure(figsize=(20, 16))
+    fig.suptitle(f'📊 {company_name} 재무지표 종합 대시보드 ({year}년)', 
+                 fontsize=24, fontweight='bold', y=0.98)
+    
+    categories = df["idx_cl_nm"].unique()
+    
+    # 2x2 그리드로 각 카테고리 배치
+    positions = [(2, 2, 1), (2, 2, 2), (2, 2, 3), (2, 2, 4)]
+    colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4']
+    
+    for i, category in enumerate(categories):
+        if i >= len(positions):
+            break
+            
+        sub_df = df[df["idx_cl_nm"] == category].copy()
+        if sub_df.empty:
+            continue
+            
+        ax = plt.subplot(*positions[i])
+        
+        # 카테고리별 아이콘
+        icons = {'수익성': '💰', '안정성': '🛡️', '성장성': '🚀', '활동성': '⚡'}
+        icon = icons.get(category, '📊')
+        
+        # 수평 막대 그래프
+        y_pos = np.arange(len(sub_df))
+        bars = ax.barh(y_pos, sub_df['idx_val'], color=colors[i], alpha=0.8, height=0.6)
+        
+        # 지표명 설정 (축약)
+        labels = [name.replace('(', '\n(') for name in sub_df['idx_nm']]
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(labels, fontsize=9)
+        
+        # 값 표시
+        for j, (bar, val) in enumerate(zip(bars, sub_df['idx_val'])):
+            interpretation, color = get_interpretation(category, sub_df.iloc[j]['idx_nm'], val)
+            ax.text(bar.get_width() + max(sub_df['idx_val']) * 0.01, 
+                   bar.get_y() + bar.get_height()/2, 
+                   f'{val:.2f}', ha='left', va='center', fontweight='bold')
+            ax.text(bar.get_width() + max(sub_df['idx_val']) * 0.15, 
+                   bar.get_y() + bar.get_height()/2, 
+                   interpretation, ha='left', va='center', fontsize=8)
+        
+        ax.set_title(f'{icon} {category}', fontsize=14, fontweight='bold', pad=15)
+        ax.set_xlabel('지표값', fontsize=10)
+        ax.grid(True, alpha=0.3, axis='x')
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+    
+    plt.tight_layout()
+    plt.subplots_adjust(top=0.93, hspace=0.3, wspace=0.3)
+    plt.show()
+
+# 7. 카테고리별 상세 분석 시각화
+def create_detailed_analysis(df, company_name, year):
+    """카테고리별 상세 분석"""
+    categories = df["idx_cl_nm"].unique()
+    
+    for category in categories:
+        sub_df = df[df["idx_cl_nm"] == category].copy()
+        if sub_df.empty:
+            continue
+            
+        plt.figure(figsize=(14, 8))
+        
+        # 배경 색상 설정
+        colors_dict = {'수익성': '#FFE5E5', '안정성': '#E5F9F6', 
+                      '성장성': '#E5F3FF', '활동성': '#F0F8E5'}
+        plt.gca().set_facecolor(colors_dict.get(category, '#F8F9FA'))
+        
+        # 지표값에 따른 색상 매핑
+        bar_colors = []
+        interpretations = []
+        
+        for _, row in sub_df.iterrows():
+            interp, color = get_interpretation(category, row['idx_nm'], row['idx_val'])
+            bar_colors.append(color)
+            interpretations.append(interp)
+        
+        # 수직 막대 그래프
+        bars = plt.bar(range(len(sub_df)), sub_df['idx_val'], 
+                      color=bar_colors, alpha=0.8, width=0.6)
+        
+        # 값과 해석 표시
+        for i, (bar, val, interp) in enumerate(zip(bars, sub_df['idx_val'], interpretations)):
+            plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(sub_df['idx_val']) * 0.01,
+                    f'{val:.2f}', ha='center', va='bottom', fontweight='bold', fontsize=11)
+            plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(sub_df['idx_val']) * 0.08,
+                    interp, ha='center', va='bottom', fontsize=9, 
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8))
+        
+        # 축 설정
+        plt.xticks(range(len(sub_df)), 
+                  [name.replace('(', '\n(') for name in sub_df['idx_nm']], 
+                  rotation=45, ha='right')
+        plt.ylabel('지표값', fontsize=12)
+        
+        # 제목과 아이콘
+        icons = {'수익성': '💰', '안정성': '🛡️', '성장성': '🚀', '활동성': '⚡'}
+        icon = icons.get(category, '📊')
+        plt.title(f'{icon} {company_name} - {category} 지표 상세분석 ({year}년)', 
+                 fontsize=16, fontweight='bold', pad=20)
+        
+        # 평균선 추가
+        avg_val = sub_df['idx_val'].mean()
+        plt.axhline(y=avg_val, color='red', linestyle='--', alpha=0.7, 
+                   label=f'평균값: {avg_val:.2f}')
+        plt.legend()
+        
+        # 격자와 스타일
+        plt.grid(True, alpha=0.3, axis='y')
+        plt.gca().spines['top'].set_visible(False)
+        plt.gca().spines['right'].set_visible(False)
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # 카테고리별 해석 텍스트
+        print(f"\n📋 {category} 지표 해석:")
+        print("=" * 50)
+        for _, row in sub_df.iterrows():
+            interp, _ = get_interpretation(category, row['idx_nm'], row['idx_val'])
+            print(f"• {row['idx_nm']}: {row['idx_val']:.2f} → {interp}")
+
+# 8. 레이더 차트로 종합 평가
+def create_radar_chart(df, company_name, year):
+    """레이더 차트로 종합 재무 건전성 표시"""
+    category_scores = {}
+    
+    for category in df["idx_cl_nm"].unique():
+        sub_df = df[df["idx_cl_nm"] == category]
+        # 각 카테고리의 평균 점수 계산 (0-100 스케일로 정규화)
+        avg_score = sub_df['idx_val'].mean()
+        
+        # 카테고리별 점수 정규화 (실제 데이터에 맞게 조정 필요)
+        if category == "수익성":
+            normalized_score = min(100, max(0, avg_score * 5))
+        elif category == "안정성":
+            normalized_score = min(100, max(0, avg_score / 2))
+        elif category == "성장성":
+            normalized_score = min(100, max(0, (avg_score + 20) * 2.5))
+        else:  # 활동성
+            normalized_score = min(100, max(0, avg_score * 20))
+            
+        category_scores[category] = normalized_score
+    
+    # 레이더 차트 생성
+    categories = list(category_scores.keys())
+    values = list(category_scores.values())
+    
+    # 각도 계산
+    angles = np.linspace(0, 2 * np.pi, len(categories), endpoint=False)
+    values += values[:1]  # 첫 번째 값을 마지막에 추가하여 차트를 닫음
+    angles = np.concatenate((angles, [angles[0]]))
+    
+    fig, ax = plt.subplots(figsize=(10, 10), subplot_kw=dict(projection='polar'))
+    
+    # 레이더 차트 그리기
+    ax.plot(angles, values, 'o-', linewidth=3, color='#FF6B6B', alpha=0.8)
+    ax.fill(angles, values, alpha=0.25, color='#FF6B6B')
+    
+    # 카테고리 라벨
+    ax.set_xticks(angles[:-1])
+    icons = ['💰', '🛡️', '🚀', '⚡']
+    ax.set_xticklabels([f'{icon}\n{cat}' for icon, cat in zip(icons, categories)], 
+                       fontsize=12)
+    
+    # 점수 표시
+    for angle, value, category in zip(angles[:-1], values[:-1], categories):
+        ax.text(angle, value + 5, f'{value:.1f}', ha='center', va='center', 
+               fontweight='bold', fontsize=10,
+               bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8))
+    
+    ax.set_ylim(0, 100)
+    ax.set_title(f'🎯 {company_name} 종합 재무건전성 레이더 ({year}년)', 
+                fontsize=16, fontweight='bold', pad=30)
+    
+    # 격자선
+    ax.grid(True, alpha=0.3)
+    ax.set_rticks([20, 40, 60, 80, 100])
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # 종합 평가
+    overall_score = np.mean(values[:-1])
+    if overall_score >= 80:
+        grade = "A+ (매우우수)"
+    elif overall_score >= 70:
+        grade = "A (우수)"
+    elif overall_score >= 60:
+        grade = "B (양호)"
+    elif overall_score >= 50:
+        grade = "C (보통)"
+    else:
+        grade = "D (개선필요)"
+    
+    print(f"\n🏆 {company_name} 종합 재무건전성 평가")
+    print("=" * 50)
+    print(f"종합 점수: {overall_score:.1f}/100점")
+    print(f"평가 등급: {grade}")
+
+# 9. 실행 부분
+def main():
+    company_name = "삼성전자"
+    year = "2023"
+    reprt_code = "11014"  # 3분기 보고서
+
+    print(f"🔍 {company_name}의 {year}년 재무지표 분석을 시작합니다...")
+    
+    if download_and_extract_corp_code():
+        corp_code = get_corp_code(company_name)
+        if corp_code:
+            all_data = fetch_all_indexes(corp_code, year, reprt_code)
+            if not all_data.empty:
+                print(f"\n📊 총 {len(all_data)}개의 재무지표를 수집했습니다.")
+                
+                # 1. 종합 대시보드
+                print("\n🎨 종합 대시보드 생성 중...")
+                create_financial_dashboard(all_data, company_name, year)
+                
+                # 2. 카테고리별 상세 분석
+                print("\n📈 카테고리별 상세 분석 중...")
+                create_detailed_analysis(all_data, company_name, year)
+                
+                # 3. 레이더 차트 종합 평가
+                print("\n🎯 종합 평가 레이더 차트 생성 중...")
+                create_radar_chart(all_data, company_name, year)
+                
+            else:
+                print("❗ 수집된 데이터가 없습니다.")
+
+if __name__ == "__main__":
+    main()
